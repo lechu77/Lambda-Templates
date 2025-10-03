@@ -27,6 +27,8 @@ This Lambda function monitors the VPN connection on a specified EC2 instance. It
     *   `TARGET_IP`: The IP address that the `VPN_TEST_COMM` will use for its test.
     *   `PORT`: The port to be used in the `VPN_TEST_COMM`.
 
+-
+
 ### `Create-CLIENT-Route53-and-ACM.py`
 
 **Purpose:**
@@ -49,7 +51,9 @@ This Lambda function automates the setup of DNS records in AWS Route 53 and requ
     *   `BASE_SUB_DOMAIN`: The base subdomain for which to create records (e.g., `client1`). The script will create records for `client1.example.com`, `client1-api.example.com`, and `ecoaas-api-client1.example.com`.
     *   `IP_ADDRESS`: The IP address that the `A` records will point to.
 
-### `EC2-Simple-Auth.py`
+-
+
+### `EC2-StartStopStatus-Simple-Auth.py`
 
 **Purpose:**
 
