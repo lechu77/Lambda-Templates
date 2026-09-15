@@ -1,285 +1,202 @@
 # 🐍 Lambda Templates by Lechu
 
-Welcome to my collection of AWS Lambda functions! ⚡ This repository contains Python scripts designed for various automation tasks in AWS environments.
+Welcome to my collection of AWS Lambda functions! ⚡ This repository contains production-hardened Python scripts designed for cloud automation, infrastructure orchestration, compute management, and network monitoring in AWS environments.
 
-⚠️ **Disclaimer**: Regardless that I use these scripts in production environments, these scripts are provided as-is for educational and experimental purposes. Use at your own risk and thoroughly test in your own environment before any deployment. The author is not responsible for any damages or issues that may arise from using these scripts.
+⚠️ **Disclaimer**: These scripts are provided as-is for educational and automation purposes. Always thoroughly test in your own staging environment before production deployment.
+
+---
 
 ## 📋 Table of Contents
 
-- [🔧 Infrastructure Automation](#-infrastructure-automation)
-- [🖥️ EC2 Management](#️-ec2-management)
-- [🌐 Network & VPN Monitoring](#-network--vpn-monitoring)
-- [🚀 Quick Start](#-quick-start)
-- [📖 Deployment Guide](#-deployment-guide)
+- [🔧 Infrastructure Automation: Route53 & ACM](#-infrastructure-automation-route53--acm)
+- [🖥️ Compute Management: EC2 Web Controller](#️-compute-management-ec2-web-controller)
+- [🌐 Network Monitoring: VPN Auto-Recovery](#-network-monitoring-vpn-auto-recovery)
+- [🧪 Automated Testing](#-automated-testing)
+- [🏛️ Architecture Decision Records (ADRs)](#️-architecture-decision-records-adrs)
+- [🚀 Quick Start & Deployment Guide](#-quick-start--deployment-guide)
 - [🔒 Security Best Practices](#-security-best-practices)
-- [🤝 Contributing](#-contributing)
+- [🤝 Contributing & Standards](#-contributing--standards)
 
-## 🔧 Infrastructure Automation
+---
 
-### Route53 & ACM Certificate Manager
-**File:** `python/Create-CLIENT-Route53-and-ACM.py`
+## 🔧 Infrastructure Automation: Route53 & ACM
 
-Automates DNS setup and SSL certificate provisioning for new clients or applications.
+**File:** `python/Create-CLIENT-Route53-and-ACM.py`  
+**Test Suite:** `tests/test_create_route53_acm.py`
 
-**Features:**
-- 🌐 **Hosted Zone Management**: Creates or uses existing Route53 hosted zones
-- 📝 **DNS Record Creation**: Automatically creates A records for:
-  - `{client}.{domain.com}`
-  - `{client}-api.{domain.com}`
-  - `ecoaas-api-{client}.{domain.com}`
-- 🔐 **SSL Certificate Provisioning**: Requests ACM certificates for HTTPS
-- ⚡ **Multi-region Support**: Works with both regional and us-east-1 ACM
+Automates Route 53 DNS setup and dual-region SSL certificate provisioning (regional and `us-east-1` for CloudFront) for new clients or applications.
 
-**Environment Variables:**
+### Key Hardened Features:
+- 🎯 **Exact Hosted Zone Matching**: Resolves public hosted zones by exact domain match (`zone['Name'] == f"{domain}."`), preventing accidental modification of unrelated prefix zones in multi-tenant accounts.
+- ⚡ **Atomic Batch Operations**: DNS A-records are committed in a single atomic `ChangeBatch` transaction, minimizing Route 53 API roundtrips and preventing throttling.
+- 🔄 **Certificate Idempotency**: Inspects ACM via `list_certificates` before requesting new certificates, reusing existing `ISSUED` or `PENDING_VALIDATION` certificates to prevent account quota exhaustion.
+- ⏱️ **Bounded Validation Polling**: Polls `DomainValidationOptions` until `ResourceRecord` is populated, avoiding race conditions and permanent pending validation states.
+- 🛡️ **Input Sanitization**: Validates `IP_ADDRESS` via standard `ipaddress.ip_address` and strictly validates domain formats.
+
+### Environment Variables:
 ```bash
 DOMAIN_NAME=example.com
 BASE_SUB_DOMAIN=client1
 IP_ADDRESS=1.2.3.4
+LOG_LEVEL=INFO  # Optional: DEBUG, INFO, WARNING, ERROR
 ```
 
-**IAM Permissions Required:**
-- `route53:CreateHostedZone`
+### IAM Permissions Required:
 - `route53:ListHostedZonesByName`
+- `route53:CreateHostedZone`
 - `route53:ChangeResourceRecordSets`
+- `acm:ListCertificates`
 - `acm:RequestCertificate`
 - `acm:DescribeCertificate`
-- `acm:ListCertificates`
 
-**Use Case:** Perfect for SaaS platforms needing to quickly provision DNS and certificates for new clients.
+---
 
-## 🖥️ EC2 Management
+## 🖥️ Compute Management: EC2 Web Controller
 
-### EC2 Start/Stop Web Interface
-**File:** `python/EC2-StartStopStatus-Simple-Auth.py`
+**File:** `python/EC2-StartStopStatus-Simple-Auth.py`  
+**Test Suite:** `tests/test_ec2_simple_auth.py`
 
-Provides a secure web interface for controlling EC2 instances with simple authentication.
+Provides a lightweight, serverless web interface for starting, stopping, and monitoring the status of an EC2 instance with built-in authentication.
 
-**Features:**
-- 🔐 **Simple Authentication**: Username/password with SHA256 hashing
-- 🍪 **Session Management**: Secure session tokens with expiration
-- 🎛️ **Instance Control**: Start, stop, and check status of EC2 instances
-- 🌐 **Web Interface**: Clean HTML interface for easy management
-- 📱 **API Gateway Compatible**: Works with API Gateway or ALB
+### Key Hardened Features:
+- 🎫 **Stateless HMAC-SHA256 Sessions**: Replaces ephemeral in-memory storage with cryptographically signed session tokens (`SESSION_SECRET`). Sessions persist across Lambda cold starts and horizontal container scaling without requiring DynamoDB.
+- 🛡️ **CSRF & Method Protection**: State-changing endpoints (`/start`, `/stop`) strictly enforce HTTP `POST` requests, preventing unintended triggers by web crawlers, browser prefetching, or cross-site image attacks (`405 Method Not Allowed` on `GET`).
+- 🔐 **Secure Form Parsing**: Uses standard `urllib.parse` and `SimpleCookie` to reliably handle special characters in credentials (`@`, `&`, `=`, `#`) and case-insensitive cookie headers.
+- 🚦 **Transitional Status Indicators**: Visual indicators for all instance states:
+  - 🟢 `running` (Green)
+  - 🟡 `pending`, `stopping`, `shutting-down` (Amber)
+  - 🔴 `stopped` (Red)
+  - ⚪ `terminated` (Gray)
+- 🔒 **Security Headers & XSS Defense**: Emits `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and sanitizes dynamic output with `html.escape()`.
 
-**Environment Variables:**
+### Environment Variables:
 ```bash
 INSTANCE_ID=i-1234567890abcdef0
 AWS_ALT_REGION=us-west-2
 AUTH_USERNAME=admin
-AUTH_PASSWORD_HASH=sha256_hash_of_password
+AUTH_PASSWORD_HASH=your_sha256_hash_of_password
 SESSION_SECRET=random_32_byte_hex_string
+LOG_LEVEL=INFO
 ```
 
-**IAM Permissions Required:**
+### IAM Permissions Required:
+- `ec2:DescribeInstances`
+- `ec2:DescribeInstanceStatus`
 - `ec2:StartInstances`
 - `ec2:StopInstances`
-- `ec2:DescribeInstances`
-
-**Security Features:**
-- 🔒 Password hashing with SHA256
-- 🎫 Secure session tokens
-- ⏰ Session expiration (24 hours)
-- 🛡️ HMAC-based token verification
-
-**Use Case:** Ideal for providing controlled access to EC2 instances for non-technical users or temporary access scenarios.
-
-## 🌐 Network & VPN Monitoring
-
-### VPN Health Check & Auto-Recovery
-**File:** `python/check-vpn-on-EC2.py`
-
-Monitors VPN connections on EC2 instances and performs automatic recovery actions.
-
-**Features:**
-- 🔍 **Connectivity Testing**: Configurable network connectivity tests
-- 🔄 **Auto-Recovery**: Automatic VPN service restart on failure
-- 💰 **Cost Optimization**: Terminates non-functional instances to save costs
-- 📊 **Detailed Logging**: Comprehensive logging for troubleshooting
-- ⚙️ **SSM Integration**: Uses Systems Manager for remote command execution
-
-**Environment Variables:**
-```bash
-EC2_INSTANCE_ID=i-1234567890abcdef0
-VPN_TEST_COMM=nc -w3 -zvvv
-VPN_RESTART_COMM=sudo systemctl restart strongswan
-TARGET_IP=10.0.1.100
-PORT=22
-```
-
-**IAM Permissions Required:**
-- `ssm:SendCommand`
-- `ssm:GetCommandInvocation`
-- `ec2:TerminateInstances`
-
-**Prerequisites:**
-- EC2 instance with SSM Agent installed
-- Instance role with `AmazonSSMManagedInstanceCore` policy
-
-**Recovery Logic:**
-1. 🧪 **Test Connection**: Execute connectivity test command
-2. ✅ **Success**: Log success and exit
-3. ❌ **Failure**: Attempt VPN service restart
-4. 🔄 **Retry**: Test connection again after restart
-5. 💀 **Terminate**: If still failing, terminate instance to prevent costs
-
-**Use Case:** Essential for hybrid cloud environments with VPN connections that need high availability and cost control.
-
-## 🚀 Quick Start
-
-### Prerequisites
-- AWS CLI configured with appropriate permissions
-- Python 3.8+ runtime for Lambda
-- Basic understanding of AWS Lambda and IAM
-
-### Deployment Steps
-
-1. **Clone the repository:**
-```bash
-git clone https://github.com/Lechu77/Lambda-Templates.git
-cd Lambda-Templates
-```
-
-2. **Choose your function and configure environment variables**
-
-3. **Deploy using AWS CLI:**
-```bash
-# Create deployment package
-zip -r function.zip python/your-function.py
-
-# Create Lambda function
-aws lambda create-function \
-  --function-name your-function-name \
-  --runtime python3.9 \
-  --role arn:aws:iam::account:role/lambda-execution-role \
-  --handler your-function.lambda_handler \
-  --zip-file fileb://function.zip \
-  --environment Variables='{
-    "ENV_VAR1":"value1",
-    "ENV_VAR2":"value2"
-  }'
-```
-
-## 📖 Deployment Guide
-
-### Route53 & ACM Function
-```bash
-# Set environment variables
-aws lambda update-function-configuration \
-  --function-name route53-acm-setup \
-  --environment Variables='{
-    "DOMAIN_NAME":"example.com",
-    "BASE_SUB_DOMAIN":"client1",
-    "IP_ADDRESS":"1.2.3.4"
-  }'
-
-# Test the function
-aws lambda invoke \
-  --function-name route53-acm-setup \
-  --payload '{}' \
-  response.json
-```
-
-### EC2 Control Interface
-```bash
-# Generate password hash
-echo -n "your_password" | shasum -a 256
-
-# Generate session secret
-openssl rand -hex 32
-
-# Deploy with API Gateway
-aws lambda update-function-configuration \
-  --function-name ec2-control \
-  --environment Variables='{
-    "INSTANCE_ID":"i-1234567890abcdef0",
-    "AWS_ALT_REGION":"us-west-2",
-    "AUTH_USERNAME":"admin",
-    "AUTH_PASSWORD_HASH":"your_sha256_hash",
-    "SESSION_SECRET":"your_32_byte_hex"
-  }'
-```
-
-### VPN Monitor Setup
-```bash
-# Configure monitoring
-aws lambda update-function-configuration \
-  --function-name vpn-monitor \
-  --environment Variables='{
-    "EC2_INSTANCE_ID":"i-1234567890abcdef0",
-    "VPN_TEST_COMM":"nc -w3 -zvvv",
-    "VPN_RESTART_COMM":"sudo systemctl restart strongswan",
-    "TARGET_IP":"10.0.1.100",
-    "PORT":"22"
-  }'
-
-# Schedule with EventBridge
-aws events put-rule \
-  --name vpn-monitor-schedule \
-  --schedule-expression "rate(5 minutes)"
-```
-
-## 🔒 Security Best Practices
-
-### IAM Roles
-- 🎯 **Principle of Least Privilege**: Grant only necessary permissions
-- 🏷️ **Resource-Specific Policies**: Limit access to specific resources when possible
-- 📝 **Regular Audits**: Review and update permissions regularly
-
-### Environment Variables
-- 🔐 **Sensitive Data**: Use AWS Secrets Manager for passwords and keys
-- 🔄 **Rotation**: Implement regular rotation of secrets
-- 📊 **Monitoring**: Log access to sensitive environment variables
-
-### Network Security
-- 🌐 **VPC Configuration**: Deploy Lambda functions in private subnets when needed
-- 🛡️ **Security Groups**: Configure appropriate security group rules
-- 🔍 **Monitoring**: Enable CloudTrail and CloudWatch for audit trails
-
-## 🏗️ Function Categories
-
-| Category | Functions | Purpose |
-|----------|-----------|---------|
-| **Infrastructure** 🔧 | Route53 & ACM | DNS and certificate automation |
-| **Compute** 🖥️ | EC2 Control | Instance management interface |
-| **Monitoring** 🌐 | VPN Health Check | Network connectivity monitoring |
-
-## 🎯 Best Practices
-
-- 📝 **Error Handling**: Implement comprehensive error handling and logging
-- ⏰ **Timeouts**: Set appropriate timeout values for your functions
-- 💾 **Memory Optimization**: Right-size memory allocation for performance
-- 🔄 **Retry Logic**: Implement exponential backoff for external API calls
-- 📊 **Monitoring**: Use CloudWatch metrics and alarms
-- 🧪 **Testing**: Test functions thoroughly in development environments
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. 🍴 Fork the repository
-2. 🌿 Create a feature branch
-3. ✅ Test your functions thoroughly
-4. 📝 Update documentation
-5. 🔄 Submit a pull request
-
-### Code Standards
-- Follow PEP 8 Python style guidelines
-- Include comprehensive error handling
-- Add detailed docstrings and comments
-- Test with multiple AWS regions when applicable
-
-## 📞 Support
-
-For questions or issues:
-- 🐛 Open an issue in this repository
-- 📧 Contact: [Your contact information]
-
-## 📄 License
-
-This project is licensed under the terms included in the `LICENSE` file.
 
 ---
 
-**⭐ If you find these Lambda functions useful, please give this repository a star!**
+## 🌐 Network Monitoring: VPN Auto-Recovery
+
+**File:** `python/check-vpn-on-EC2.py`  
+**Test Suite:** `tests/test_check_vpn_ec2.py`
+
+Monitors VPN health on an EC2 instance via AWS Systems Manager (SSM) Run Command and initiates automatic service restarts upon failure.
+
+### Key Hardened Features:
+- 🛡️ **Safe Opt-In Auto-Termination**: Prevents accidental instance destruction. Auto-termination is disabled by default (`ENABLE_AUTO_TERMINATE=false`) and will never trigger on script exceptions, IAM issues, or transient SSM network timeouts.
+- 💉 **Command Injection Defense**: Strict validation of `TARGET_IP` (`ipaddress.ip_address` or secure hostname regex) and `PORT` (integer 1–65535) before constructing remote shell commands.
+- ⏳ **Bounded SSM Polling**: Correctly handles `Pending`, `InProgress`, and `Delayed` SSM execution states with monotonic timeout limits to prevent infinite execution freezes.
+- 📊 **Structured Status Payload**: Returns explicit operational statuses (`HEALTHY`, `RECOVERED`, `UNHEALTHY`, `TERMINATED`, `CONFIG_ERROR`, `ERROR`).
+
+### Environment Variables:
+```bash
+EC2_INSTANCE_ID=i-1234567890abcdef0
+TARGET_IP=10.0.1.100
+PORT=22
+VPN_TEST_COMM="nc -w3 -zvvv"                          # Optional
+VPN_RESTART_COMM="sudo systemctl restart strongswan"  # Optional
+ENABLE_AUTO_TERMINATE=false                           # Set to "true" to allow termination
+LOG_LEVEL=INFO
+```
+
+### IAM Permissions Required:
+- `ssm:SendCommand`
+- `ssm:GetCommandInvocation`
+- `ec2:TerminateInstances` (Only required if `ENABLE_AUTO_TERMINATE=true`)
+
+---
+
+## 🧪 Automated Testing
+
+This repository includes a comprehensive unit test suite with 100% standard library compatibility (runs without external pip dependencies via mocked Boto3 clients):
+
+```bash
+# Run the entire test suite
+python3 -m unittest discover tests
+
+# Run specific test modules
+python3 -m unittest tests/test_ec2_simple_auth.py
+python3 -m unittest tests/test_check_vpn_ec2.py
+python3 -m unittest tests/test_create_route53_acm.py
+```
+
+All 63 unit tests pass in `< 0.02s` and cover happy paths, edge cases, tamper detection, and error handling.
+
+---
+
+## 🏛️ Architecture Decision Records (ADRs)
+
+Key architectural decisions and security models are documented under `docs/adr/`:
+- [ADR-0001: Stateless HMAC Sessions and CSRF Hardening](docs/adr/0001-stateless-hmac-sessions-and-csrf-protection.md)
+- [ADR-0002: Safe VPN Monitoring, Input Sanitization, and Opt-In EC2 Termination](docs/adr/0002-safe-vpn-monitoring-and-ssm-execution.md)
+- [ADR-0003: Route 53 Exact Zone Matching, ACM Idempotency, and Validation Polling](docs/adr/0003-route53-acm-idempotency-and-dns-matching.md)
+
+---
+
+## 🚀 Quick Start & Deployment Guide
+
+### Deployment via AWS CLI
+
+1. **Package your chosen function:**
+   ```bash
+   zip -j function.zip python/EC2-StartStopStatus-Simple-Auth.py
+   ```
+
+2. **Create the Lambda function:**
+   ```bash
+   aws lambda create-function \
+     --function-name ec2-control \
+     --runtime python3.11 \
+     --role arn:aws:iam::123456789012:role/lambda-execution-role \
+     --handler EC2-StartStopStatus-Simple-Auth.lambda_handler \
+     --zip-file fileb://function.zip \
+     --environment Variables='{
+       "INSTANCE_ID":"i-1234567890abcdef0",
+       "AUTH_USERNAME":"admin",
+       "AUTH_PASSWORD_HASH":"your_sha256_hash",
+       "SESSION_SECRET":"your_32_byte_hex"
+     }'
+   ```
+
+3. **Generate password hash and session secret:**
+   ```bash
+   # SHA-256 password hash
+   echo -n "YourSecurePassword" | shasum -a 256
+
+   # Secure session secret
+   openssl rand -hex 32
+   ```
+
+---
+
+## 🔒 Security Best Practices
+
+- **Secrets Management**: Store sensitive credentials in AWS Secrets Manager or encrypted Lambda environment variables (AWS KMS).
+- **Least Privilege**: Attach IAM policies scoped strictly to the target instance IDs and hosted zone IDs.
+- **Serverless Resilience**: Stateless tokens ensure that horizontal container scaling does not disconnect active sessions.
+- **Network Isolation**: Deploy Lambda functions within VPC private subnets when interacting with internal VPN endpoints.
+
+---
+
+## 🤝 Contributing & Standards
+
+Contributions are welcome! Please follow these standards:
+- **Style**: Follow PEP 8 guidelines (max 100 characters per line, max 50 lines per function).
+- **Typing**: Include type annotations and `from __future__ import annotations`.
+- **Testing**: Add corresponding unit tests in `tests/` and verify all tests pass before submitting pull requests.
+
+---
 
 *Made with ❤️ by Lechu*
