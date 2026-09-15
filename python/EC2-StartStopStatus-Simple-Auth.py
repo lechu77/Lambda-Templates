@@ -1,169 +1,243 @@
-import boto3
-import os
+from __future__ import annotations
+
+import base64
+from datetime import datetime, timezone
 import hashlib
 import hmac
-import secrets
+import html
+from http.cookies import SimpleCookie
 import json
-from datetime import datetime, timedelta
+import logging
+import os
+import secrets
+from typing import Any, Dict, Mapping, Optional
+import urllib.parse
 
-instance_id = os.getenv('INSTANCE_ID')
-region_name = os.getenv('AWS_ALT_REGION')
-ec2 = boto3.client('ec2', region_name=region_name)
+try:
+    import boto3
+except ImportError:
+    boto3 = None  # type: ignore
 
-AUTH_USERNAME = os.getenv('AUTH_USERNAME', 'lechu')
-AUTH_PASSWORD_HASH = os.getenv('AUTH_PASSWORD_HASH', '')
-SESSION_SECRET = os.getenv('SESSION_SECRET', secrets.token_hex(32))
+# Logging configuration
+logger = logging.getLogger("ec2_control")
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
-# Simple in-memory session storage (for demo - use DynamoDB in production)
-sessions = {}
+# Configuration constants
+AUTH_USERNAME: str = os.getenv("AUTH_USERNAME", "lechu")
+AUTH_PASSWORD_HASH: str = os.getenv("AUTH_PASSWORD_HASH", "")
+SESSION_SECRET: str = os.getenv("SESSION_SECRET", "") or secrets.token_hex(32)
+DEFAULT_SESSION_HOURS: int = 24
 
-def create_session_token(username):
-    """Create a secure session token"""
-    token = secrets.token_urlsafe(32)
-    expiry = datetime.utcnow() + timedelta(hours=24)
-    sessions[token] = {'username': username, 'expiry': expiry}
-    return token
+COMMON_CSS: str = """
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    background: #f5f7fb;
+    color: #333;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+.card {
+    background: #ffffff;
+    border-radius: 10px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+    width: 100%;
+    max-width: 540px;
+    padding: 32px;
+}
+h1 {
+    font-size: 22px;
+    color: #1a202c;
+    margin-bottom: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.error {
+    background: #fed7d7;
+    border: 1px solid #feb2b2;
+    color: #9b2c2c;
+    padding: 12px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 14px;
+}
+.form-group { margin-bottom: 16px; }
+label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 13px; color: #4a5568; }
+input {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    font-size: 14px;
+}
+input:focus { outline: 2px solid #3182ce; border-color: transparent; }
+.btn {
+    display: inline-block;
+    padding: 10px 18px;
+    border: none;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 0.2s;
+}
+.btn-primary { background: #3182ce; color: #fff; width: 100%; }
+.btn-primary:hover { background: #2b6cb0; }
+.btn-start { background: #38a169; color: #fff; margin-right: 10px; }
+.btn-start:hover { background: #2f855a; }
+.btn-stop { background: #e53e3e; color: #fff; }
+.btn-stop:hover { background: #c53030; }
+.logout {
+    font-size: 13px;
+    color: #e53e3e;
+    text-decoration: none;
+    font-weight: 500;
+}
+.logout:hover { text-decoration: underline; }
+.info-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 0;
+    border-bottom: 1px solid #edf2f7;
+    font-size: 14px;
+}
+.actions { margin-top: 24px; text-align: center; }
+"""
 
-def verify_session_token(token):
-    """Verify session token is valid"""
-    if not token or token not in sessions:
+STATE_CONFIG: Dict[str, Dict[str, str]] = {
+    "running": {"color": "#38a169", "emoji": "&#128994;"},
+    "pending": {"color": "#d69e2e", "emoji": "&#128993;"},
+    "stopping": {"color": "#dd6b20", "emoji": "&#128993;"},
+    "shutting-down": {"color": "#dd6b20", "emoji": "&#128993;"},
+    "stopped": {"color": "#e53e3e", "emoji": "&#128308;"},
+    "terminated": {"color": "#718096", "emoji": "&#9899;"},
+}
+
+
+def build_headers(extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Build standardized HTTP response headers including security protections."""
+    headers: Dict[str, str] = {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
+
+
+def create_session_token(
+    username: str, secret: str = SESSION_SECRET, ttl_hours: int = DEFAULT_SESSION_HOURS
+) -> str:
+    """Create a stateless, cryptographically signed session token."""
+    expiry_ts = int(datetime.now(timezone.utc).timestamp()) + (ttl_hours * 3600)
+    payload_raw = json.dumps({"u": username, "exp": expiry_ts}, separators=(",", ":"))
+    payload_b64 = (
+        base64.urlsafe_b64encode(payload_raw.encode("utf-8")).decode("ascii").rstrip("=")
+    )
+    sig = hmac.new(
+        secret.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"{payload_b64}.{sig}"
+
+
+def verify_session_token(token: Optional[str], secret: str = SESSION_SECRET) -> Optional[str]:
+    """Verify stateless session token integrity and expiration."""
+    if not token or not secret or "." not in token:
+        return None
+    parts = token.split(".", 1)
+    if len(parts) != 2:
+        return None
+    payload_b64, sig = parts
+    expected_sig = hmac.new(
+        secret.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected_sig, sig):
+        return None
+    try:
+        padding = "=" * (-len(payload_b64) % 4)
+        payload_bytes = base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii"))
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            return None
+        if datetime.now(timezone.utc).timestamp() > exp:
+            return None
+        return str(payload.get("u", ""))
+    except Exception as exc:
+        logger.debug("Error decoding session token: %s", exc)
+        return None
+
+
+def get_cookie(headers: Mapping[str, Any], name: str) -> Optional[str]:
+    """Extract a cookie value by name case-insensitively."""
+    cookie_header: str = ""
+    for key, val in headers.items():
+        if key.lower() == "cookie":
+            cookie_header = str(val)
+            break
+    if not cookie_header:
+        return None
+    simple_cookie: SimpleCookie = SimpleCookie()
+    try:
+        simple_cookie.load(cookie_header)
+        morsel = simple_cookie.get(name)
+        return morsel.value if morsel else None
+    except Exception as exc:
+        logger.debug("Failed parsing cookie header: %s", exc)
+        return None
+
+
+def verify_credentials(username: str, password: str) -> bool:
+    """Verify submitted username and password against configured hash."""
+    if not AUTH_PASSWORD_HASH:
+        logger.warning("AUTH_PASSWORD_HASH is not configured. Rejecting authentication.")
         return False
-    session = sessions[token]
-    if datetime.utcnow() > session['expiry']:
-        del sessions[token]
-        return False
-    return True
-
-def get_cookie(headers, name):
-    """Extract cookie value from headers"""
-    cookie_header = headers.get('cookie', '')
-    for cookie in cookie_header.split(';'):
-        cookie = cookie.strip()
-        if cookie.startswith(f'{name}='):
-            return cookie[len(name)+1:]
-    return None
-
-def verify_credentials(username, password):
-    """Verify username and password"""
-    if username == AUTH_USERNAME:
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
+    if hmac.compare_digest(username, AUTH_USERNAME):
+        password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
         return hmac.compare_digest(password_hash, AUTH_PASSWORD_HASH)
     return False
 
-def create_login_page(error_message=''):
-    """Return login page HTML"""
-    error_html = f'<div class="error">{error_message}</div>' if error_message else ''
-    
-    return {
-        'statusCode': 200,
-        'headers': {
-            'Content-Type': 'text/html; charset=utf-8',
-            'Cache-Control': 'no-cache, no-store, must-revalidate'
-        },
-        'body': f'''<!DOCTYPE html>
+
+def parse_form_body(body: str, is_base64: bool = False) -> Dict[str, str]:
+    """Safely parse urlencoded form body with proper URL decoding."""
+    if not body:
+        return {}
+    if is_base64:
+        try:
+            body = base64.b64decode(body).decode("utf-8")
+        except Exception as exc:
+            logger.error("Failed to decode base64 body: %s", exc)
+            return {}
+    parsed = urllib.parse.parse_qs(body, keep_blank_values=True)
+    return {key: val[0] for key, val in parsed.items() if val}
+
+
+def render_login_page(error_message: str = "") -> Dict[str, Any]:
+    """Render login form HTML."""
+    escaped_err = (
+        f'<div class="error">{html.escape(error_message)}</div>' if error_message else ""
+    )
+    body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EC2 Control Panel - Login</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }}
-        .login-container {{
-            background: white;
-            padding: 40px;
-            border-radius: 10px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
-            width: 100%;
-            max-width: 400px;
-        }}
-        .lock-icon {{
-            font-size: 48px;
-            text-align: center;
-            margin-bottom: 20px;
-        }}
-        h1 {{
-            color: #333;
-            margin-bottom: 10px;
-            text-align: center;
-        }}
-        .subtitle {{
-            color: #666;
-            text-align: center;
-            margin-bottom: 30px;
-            font-size: 14px;
-        }}
-        .form-group {{
-            margin-bottom: 20px;
-        }}
-        label {{
-            display: block;
-            color: #333;
-            font-weight: 500;
-            margin-bottom: 8px;
-        }}
-        input {{
-            width: 100%;
-            padding: 12px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            font-size: 14px;
-            transition: border-color 0.3s;
-        }}
-        input:focus {{
-            outline: none;
-            border-color: #667eea;
-        }}
-        .btn-login {{
-            width: 100%;
-            padding: 12px;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            font-size: 16px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: background 0.3s;
-        }}
-        .btn-login:hover {{
-            background: #5568d3;
-        }}
-        .error {{
-            background: #f8d7da;
-            border: 1px solid #f5c6cb;
-            color: #721c24;
-            padding: 12px;
-            border-radius: 5px;
-            margin-bottom: 20px;
-            text-align: center;
-        }}
-        .powered-by {{
-            text-align: center;
-            font-size: 12px;
-            color: #999;
-            margin-top: 20px;
-        }}
-    </style>
+    <style>{COMMON_CSS}</style>
 </head>
 <body>
-    <div class="login-container">
-        <div class="lock-icon">&#128274;</div>
+    <div class="card">
         <h1>EC2 Control Panel</h1>
-        <p class="subtitle">Please login to continue</p>
-        {error_html}
+        {escaped_err}
         <form method="POST" action="/login">
             <div class="form-group">
                 <label for="username">Username</label>
@@ -173,347 +247,216 @@ def create_login_page(error_message=''):
                 <label for="password">Password</label>
                 <input type="password" id="password" name="password" required>
             </div>
-            <button type="submit" class="btn-login">Login</button>
+            <button type="submit" class="btn btn-primary">Login</button>
         </form>
-        <div class="powered-by">Secured Session Authentication</div>
     </div>
 </body>
-</html>'''
-    }
+</html>"""
+    return {"statusCode": 200, "headers": build_headers(), "body": body}
 
-def lambda_handler(event, context):
-    print(f"Event: {json.dumps(event)}")
-    
-    # Get path and method
-    path = event.get('rawPath', '/').lower()
-    method = event.get('requestContext', {}).get('http', {}).get('method', 'GET')
-    headers = event.get('headers', {})
-    
-    # Handle login POST
-    if path == '/login' and method == 'POST':
-        try:
-            body = event.get('body', '')
-            if event.get('isBase64Encoded', False):
-                import base64
-                body = base64.b64decode(body).decode('utf-8')
-            
-            # Parse form data
-            params = {}
-            for param in body.split('&'):
-                if '=' in param:
-                    key, value = param.split('=', 1)
-                    # URL decode
-                    value = value.replace('+', ' ')
-                    params[key] = value
-            
-            username = params.get('username', '')
-            password = params.get('password', '')
-            
-            if verify_credentials(username, password):
-                # Create session
-                token = create_session_token(username)
-                
-                # Redirect to status with session cookie
-                return {
-                    'statusCode': 302,
-                    'headers': {
-                        'Location': '/status',
-                        'Set-Cookie': f'session={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400',
-                        'Content-Type': 'text/html'
-                    },
-                    'body': ''
-                }
-            else:
-                return create_login_page('Invalid username or password')
-                
-        except Exception as e:
-            print(f"Login error: {e}")
-            return create_login_page('Login error occurred')
-    
-    # Check authentication for protected paths
-    if AUTH_PASSWORD_HASH and path not in ['/login', '/']:
-        session_token = get_cookie(headers, 'session')
-        
-        if not verify_session_token(session_token):
-            # Not authenticated - show login
-            return create_login_page()
-    
-    # Root path - redirect to status or show login
-    if path == '/' or path == '':
-        session_token = get_cookie(headers, 'session')
-        if AUTH_PASSWORD_HASH and not verify_session_token(session_token):
-            return create_login_page()
-        return {
-            'statusCode': 302,
-            'headers': {'Location': '/status'},
-            'body': ''
-        }
-    
-    # Handle EC2 operations
-    try:
-        if path == '/start':
-            ec2.start_instances(InstanceIds=[instance_id])
-            action_message = f"Instance {instance_id} is starting."
-        
-        elif path == '/stop':
-            ec2.stop_instances(InstanceIds=[instance_id])
-            action_message = f"Instance {instance_id} is stopping."
-        
-        elif path == '/status':
-            instance_response = ec2.describe_instances(InstanceIds=[instance_id])
-            instance_state = instance_response['Reservations'][0]['Instances'][0]['State']['Name']
 
-            if instance_state == 'running':
-                status_response = ec2.describe_instance_status(InstanceIds=[instance_id])
-                if status_response['InstanceStatuses']:
-                    instance_status_data = status_response['InstanceStatuses'][0]
-                    system_status = instance_status_data['SystemStatus']['Status']
-                    instance_status = instance_status_data['InstanceStatus']['Status']
-                else:
-                    system_status = "N/A"
-                    instance_status = "N/A"
-            else:
-                system_status = "N/A"
-                instance_status = "N/A"
+def render_status_rows(
+    instance_id: str,
+    instance_state: str,
+    system_status: str,
+    instance_status: str,
+    cfg: Dict[str, str],
+) -> str:
+    """Render table rows for EC2 status card."""
+    escaped_id = html.escape(instance_id)
+    escaped_state = html.escape(instance_state.upper())
+    escaped_sys = html.escape(system_status)
+    escaped_inst = html.escape(instance_status)
+    return f"""
+        <div class="info-row"><strong>Instance ID</strong><span>{escaped_id}</span></div>
+        <div class="info-row">
+            <strong>State</strong>
+            <span style="font-weight:bold; color:{cfg['color']};">
+                {cfg['emoji']} {escaped_state}
+            </span>
+        </div>
+        <div class="info-row"><strong>System Status</strong><span>{escaped_sys}</span></div>
+        <div class="info-row"><strong>Instance Status</strong><span>{escaped_inst}</span></div>
+    """
 
-            status_color = '#009900' if instance_state == 'running' else '#cc0000'
-            status_emoji = '&#128994;' if instance_state == 'running' else '&#128308;'
-            
-            html_content = f"""<!DOCTYPE html>
+
+def render_status_page(
+    instance_id: str,
+    instance_state: str,
+    system_status: str,
+    instance_status: str,
+) -> Dict[str, Any]:
+    """Render instance status dashboard with POST action forms."""
+    cfg = STATE_CONFIG.get(instance_state, {"color": "#4a5568", "emoji": "&#10067;"})
+    escaped_id = html.escape(instance_id)
+    rows_html = render_status_rows(
+        instance_id, instance_state, system_status, instance_status, cfg
+    )
+    body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EC2 Instance Status</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background: #f5f5f5;
-        }}
-        .container {{
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        h1 {{
-            color: #0066cc;
-            border-bottom: 2px solid #0066cc;
-            padding-bottom: 10px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }}
-        .info {{
-            background-color: #f8f9fa;
-            border: 1px solid #dee2e6;
-            border-radius: 8px;
-            padding: 20px;
-            margin-top: 20px;
-        }}
-        .status {{
-            font-weight: bold;
-            color: {status_color};
-            font-size: 18px;
-        }}
-        .logout {{
-            background: #dc3545;
-            color: white;
-            padding: 8px 15px;
-            text-decoration: none;
-            border-radius: 5px;
-            font-size: 12px;
-            transition: background 0.3s;
-        }}
-        .logout:hover {{
-            background: #c82333;
-        }}
-        .actions {{
-            margin-top: 20px;
-            text-align: center;
-        }}
-        .btn {{
-            display: inline-block;
-            padding: 10px 20px;
-            margin: 0 10px;
-            text-decoration: none;
-            border-radius: 5px;
-            font-weight: bold;
-            transition: all 0.3s;
-        }}
-        .btn-start {{
-            background: #28a745;
-            color: white;
-        }}
-        .btn-stop {{
-            background: #dc3545;
-            color: white;
-        }}
-        .btn:hover {{
-            transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
-        }}
-    </style>
+    <title>EC2 Status - {escaped_id}</title>
+    <style>{COMMON_CSS}</style>
 </head>
 <body>
-    <div class="container">
-        <h1>
-            EC2 Instance Status
-            <a href="/logout" class="logout">Logout</a>
-        </h1>
-        <div class="info">
-            <p><strong>Instance ID:</strong> {instance_id}</p>
-            <p><strong>Instance State:</strong> <span class="status">{status_emoji} {instance_state.upper()}</span></p>
-            <p><strong>System Status:</strong> {system_status}</p>
-            <p><strong>Instance Status:</strong> {instance_status}</p>
-        </div>
+    <div class="card">
+        <h1><span>EC2 Status</span><a href="/logout" class="logout">Logout</a></h1>
+        {rows_html}
         <div class="actions">
-            <a href="/start" class="btn btn-start">Start Instance</a>
-            <a href="/stop" class="btn btn-stop">Stop Instance</a>
+            <form method="POST" action="/start" style="display:inline-block;">
+                <button type="submit" class="btn btn-start">Start Instance</button>
+            </form>
+            <form method="POST" action="/stop" style="display:inline-block;">
+                <button type="submit" class="btn btn-stop">Stop Instance</button>
+            </form>
         </div>
     </div>
 </body>
 </html>"""
-            return {
-                'statusCode': 200,
-                'headers': {
-                    'Content-Type': 'text/html; charset=utf-8'
-                },
-                'body': html_content
-            }
+    return {"statusCode": 200, "headers": build_headers(), "body": body}
 
-        elif path == '/logout':
-            return {
-                'statusCode': 302,
-                'headers': {
-                    'Location': '/',
-                    'Set-Cookie': 'session=; Path=/; HttpOnly; Secure; Max-Age=0',
-                    'Content-Type': 'text/html'
-                },
-                'body': ''
-            }
 
-        else:
-            action_message = "Invalid path. Please use /start, /stop, or /status."
-
-        # Response for /start or /stop
-        html_content = f"""<!DOCTYPE html>
+def render_action_page(message: str, is_error: bool = False) -> Dict[str, Any]:
+    """Render action confirmation or error page."""
+    escaped_msg = html.escape(message)
+    msg_class = "error" if is_error else "info-row"
+    body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EC2 Instance Action</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background: #f5f5f5;
-        }}
-        .container {{
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            text-align: center;
-        }}
-        h1 {{
-            color: #0066cc;
-            border-bottom: 2px solid #0066cc;
-            padding-bottom: 10px;
-        }}
-        .message {{
-            background-color: #d4edda;
-            border: 1px solid #c3e6cb;
-            border-radius: 8px;
-            padding: 20px;
-            margin: 20px 0;
-            font-size: 18px;
-        }}
-        .back-btn {{
-            background: #0066cc;
-            color: white;
-            padding: 10px 20px;
-            text-decoration: none;
-            border-radius: 5px;
-            display: inline-block;
-            margin-top: 20px;
-        }}
-    </style>
+    <title>EC2 Action Result</title>
+    <style>{COMMON_CSS}</style>
 </head>
 <body>
-    <div class="container">
-        <h1>EC2 Instance Action</h1>
-        <div class="message">
-            <p>{action_message}</p>
+    <div class="card" style="text-align:center;">
+        <h1>EC2 Action Result</h1>
+        <div class="{msg_class}" style="padding: 16px; margin: 16px 0; justify-content: center;">
+            <p>{escaped_msg}</p>
         </div>
-        <a href="/status" class="back-btn">View Status</a>
+        <a href="/status" class="btn btn-primary" style="display:inline-block; width:auto;">
+            View Status
+        </a>
     </div>
 </body>
 </html>"""
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EC2 Instance Error</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background: #f5f5f5;
-        }}
-        .container {{
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }}
-        h1 {{
-            color: #cc0000;
-            border-bottom: 2px solid #cc0000;
-            padding-bottom: 10px;
-        }}
-        .error {{
-            background-color: #f8d7da;
-            border: 1px solid #f5c6cb;
-            border-radius: 8px;
-            padding: 20px;
-            margin-top: 20px;
-            color: #721c24;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>EC2 Instance Error</h1>
-        <div class="error">
-            <p><strong>Error retrieving status for EC2 instance {instance_id}:</strong></p>
-            <p>{str(e)}</p>
-        </div>
-    </div>
-</body>
-</html>"""
+    status_code = 400 if is_error else 200
+    return {"statusCode": status_code, "headers": build_headers(), "body": body}
 
-    return {
-        'statusCode': 200,
-        'headers': {
-            'Content-Type': 'text/html; charset=utf-8'
-        },
-        'body': html_content
-    }
+
+def get_ec2_client(region_name: Optional[str] = None) -> Any:
+    """Instantiate and return boto3 ec2 client."""
+    if boto3 is None:
+        raise RuntimeError("boto3 library is required to interact with AWS EC2")
+    return boto3.client("ec2", region_name=region_name)
+
+
+def handle_ec2_status(ec2_client: Any, instance_id: str) -> Dict[str, Any]:
+    """Query EC2 instance state and status checks."""
+    response = ec2_client.describe_instances(InstanceIds=[instance_id])
+    reservations = response.get("Reservations", [])
+    if not reservations or not reservations[0].get("Instances"):
+        raise ValueError(f"Instance {instance_id} was not found.")
+
+    instance = reservations[0]["Instances"][0]
+    instance_state = instance.get("State", {}).get("Name", "unknown")
+    system_status = "N/A"
+    instance_status = "N/A"
+
+    if instance_state == "running":
+        status_resp = ec2_client.describe_instance_status(InstanceIds=[instance_id])
+        statuses = status_resp.get("InstanceStatuses", [])
+        if statuses:
+            system_status = statuses[0].get("SystemStatus", {}).get("Status", "N/A")
+            instance_status = statuses[0].get("InstanceStatus", {}).get("Status", "N/A")
+
+    return render_status_page(instance_id, instance_state, system_status, instance_status)
+
+
+def handle_login(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Process login form submission and issue session cookie if valid."""
+    form_data = parse_form_body(
+        event.get("body", ""), event.get("isBase64Encoded", False)
+    )
+    username = form_data.get("username", "")
+    password = form_data.get("password", "")
+
+    if verify_credentials(username, password):
+        token = create_session_token(username)
+        cookie_val = (
+            f"session={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400"
+        )
+        return {
+            "statusCode": 302,
+            "headers": build_headers(
+                {"Location": "/status", "Set-Cookie": cookie_val}
+            ),
+            "body": "",
+        }
+    return render_login_page("Invalid username or password")
+
+
+def handle_ec2_action(ec2_client: Any, path: str, instance_id: str) -> Dict[str, Any]:
+    """Execute start or stop operations on target EC2 instance."""
+    if path == "/start":
+        ec2_client.start_instances(InstanceIds=[instance_id])
+        return render_action_page(f"Instance {instance_id} is starting.")
+    if path == "/stop":
+        ec2_client.stop_instances(InstanceIds=[instance_id])
+        return render_action_page(f"Instance {instance_id} is stopping.")
+    return render_action_page(
+        "Invalid path. Use /start, /stop, or /status.", is_error=True
+    )
+
+
+def is_authenticated(path: str, headers: Mapping[str, Any]) -> bool:
+    """Determine whether request has valid authentication for protected path."""
+    if not AUTH_PASSWORD_HASH or path in ("/login", "/logout"):
+        return True
+    session_token = get_cookie(headers, "session")
+    return verify_session_token(session_token) is not None
+
+
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """Main AWS Lambda entrypoint."""
+    path = (event.get("rawPath") or event.get("path") or "/").lower()
+    http_ctx = event.get("requestContext", {}).get("http", {})
+    method = (http_ctx.get("method") or event.get("httpMethod") or "GET").upper()
+    headers = event.get("headers", {}) or {}
+
+    instance_id = os.getenv("INSTANCE_ID", "")
+    region_name = os.getenv("AWS_ALT_REGION")
+
+    if path == "/login" and method == "POST":
+        return handle_login(event)
+    if not is_authenticated(path, headers):
+        return render_login_page()
+    if path in ("/", ""):
+        return {"statusCode": 302, "headers": build_headers({"Location": "/status"}), "body": ""}
+    if path == "/logout":
+        expired = "session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"
+        return {
+            "statusCode": 302,
+            "headers": build_headers({"Location": "/login", "Set-Cookie": expired}),
+            "body": "",
+        }
+    if not instance_id:
+        return render_action_page(
+            "INSTANCE_ID environment variable is not configured.", is_error=True
+        )
+    if path in ("/start", "/stop") and method != "POST":
+        err = render_action_page("Method Not Allowed. Action requires POST.", is_error=True)
+        return {"statusCode": 405, "headers": build_headers({"Allow": "POST"}), "body": err["body"]}
+
+    try:
+        ec2_client = get_ec2_client(region_name=region_name)
+        if path == "/status":
+            return handle_ec2_status(ec2_client, instance_id)
+        return handle_ec2_action(ec2_client, path, instance_id)
+    except Exception as exc:
+        logger.error("EC2 execution error: %s", exc)
+        return render_action_page(
+            "An error occurred while managing the EC2 instance.", is_error=True
+        )

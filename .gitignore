@@ -1,1 +1,16 @@
 .DS_Store
+
+# Environment & Secrets (Added by agent-harness)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.db
+*.sqlite*
+__pycache__/
+*.py[cod]
+*$py.class
+node_modules/
