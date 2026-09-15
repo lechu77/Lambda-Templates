@@ -16,6 +16,13 @@
   - `tests/test_check_vpn_ec2.py` (17 unit tests, 100% pass)
   - `docs/adr/0002-safe-vpn-monitoring-and-ssm-execution.md`
   - `progress/impl_vpn_monitor_hardening.md`
-  - `progress/review_vpn_monitor_hardening.md`
-  - `progress/security_vpn_monitor_hardening.md`
-- **Result**: APPROVED & SECURE. All 46 repo unit tests passing.
+## [2026-09-15] route53_acm_hardening
+- **Objective**: Refactor python/Create-CLIENT-Route53-and-ACM.py with exact hosted zone matching, ACM polling, certificate idempotency, atomic Route53 batching, and unit tests.
+- **Artifacts**:
+  - `python/Create-CLIENT-Route53-and-ACM.py` (refactored DNS & ACM orchestrator)
+  - `tests/test_create_route53_acm.py` (17 unit tests, 100% pass)
+  - `docs/adr/0003-route53-acm-idempotency-and-dns-matching.md`
+  - `progress/impl_route53_acm_hardening.md`
+  - `progress/review_route53_acm_hardening.md`
+  - `progress/security_route53_acm_hardening.md`
+- **Result**: APPROVED & SECURE. All 63 repo unit tests passing.
