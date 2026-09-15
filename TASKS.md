@@ -20,4 +20,5 @@ Format:
 -->
 
 - [x] **ec2_auth_hardening**: Refactor python/EC2-StartStopStatus-Simple-Auth.py with stateless HMAC sessions, POST state actions, robust parsing, transitional status colors, and security headers
+- [x] **vpn_monitor_hardening**: Refactor python/check-vpn-on-EC2.py with safe auto-termination flag, bounded SSM polling, input validation, structured logging, and unit tests
 - [ ] **init_setup**: Initial project structure and setup baseline
